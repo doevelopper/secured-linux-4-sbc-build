@@ -48,13 +48,13 @@ ifeq ($(UNAME_M),x86_64)
 ifeq ($(ARCH),arm)
 AARCH32_PATH 			?= $(TOOLCHAIN_ROOT)/aarch32
 AARCH32_CROSS_COMPILE 		?= $(AARCH32_PATH)/bin/arm-linux-gnueabihf-
-AARCH32_GCC_VERSION 		?= arm-gnu-toolchain-11.3.rel1-x86_64-arm-none-linux-gnueabihf
-SRC_AARCH32_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu/11.3.rel1/binrel/$(AARCH32_GCC_VERSION).tar.xz
+AARCH32_GCC_VERSION 		?= arm-gnu-toolchain-13.2.rel1-x86_64-arm-none-linux-gnueabihf
+SRC_AARCH32_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/$(AARCH32_GCC_VERSION).tar.xz
 
 AARCH64_PATH 			?= $(TOOLCHAIN_ROOT)/aarch64
 AARCH64_CROSS_COMPILE 		?= $(AARCH64_PATH)/bin/aarch64-linux-gnu-
-AARCH64_GCC_VERSION 		?= arm-gnu-toolchain-11.3.rel1-x86_64-aarch64-none-linux-gnu
-SRC_AARCH64_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu/11.3.rel1/binrel/$(AARCH64_GCC_VERSION).tar.xz
+AARCH64_GCC_VERSION 		?= arm-gnu-toolchain-13.2.rel1-x86_64-aarch64-none-linux-gnu
+SRC_AARCH64_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/$(AARCH64_GCC_VERSION).tar.xz
 
 RUST_TOOLCHAIN_PATH 		?= $(TOOLCHAIN_ROOT)/rust
 
@@ -83,7 +83,7 @@ endef
 rust-toolchain:
 	$(call dl-rust-toolchain,$(RUST_TOOLCHAIN_PATH))
 
-CLANG_VER			?= 12.0.0
+CLANG_VER			?= 17.0.6
 CLANG_PATH			?= $(ROOT)/clang-$(CLANG_VER)
 
 # Download the Clang compiler with LLVM tools and compiler-rt libraries
@@ -119,8 +119,8 @@ else ifeq ($(UNAME_M),aarch64)
 
 AARCH32_PATH 			?= $(TOOLCHAIN_ROOT)/aarch32
 AARCH32_CROSS_COMPILE 		?= $(AARCH32_PATH)/bin/arm-linux-gnueabihf-
-AARCH32_GCC_VERSION 		?= gcc-arm-10.2-2020.11-aarch64-arm-none-linux-gnueabihf
-SRC_AARCH32_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu-a/10.2-2020.11/binrel/$(AARCH32_GCC_VERSION).tar.xz
+AARCH32_GCC_VERSION 		?= gcc-arm-10.3-2021.07-aarch64-arm-none-linux-gnueabihf
+SRC_AARCH32_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu-a/10.3-2021.07/binrel/$(AARCH32_GCC_VERSION).tar.xz
 
 # There isn't any native aarch64 toolchain released from Arm and buildroot
 # doesn't support distribution toolchain [1]. So we are left with no choice
