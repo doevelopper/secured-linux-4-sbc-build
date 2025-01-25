@@ -1,14 +1,41 @@
-FVP_USE_BASE_PLAT		?= y
 FVP_VIRTFS_ENABLE		?= y
 FVP_VIRTFS_AUTOMOUNT		?= y
 MEASURED_BOOT			?= y
 MEASURED_BOOT_FTPM		?= n
 TS_SMM_GATEWAY			?= y
+TS_LOGGING_SP			?= y
+TS_LOGGING_SP_LOG		?= "trusted-services-logs.txt"
 TS_UEFI_TESTS			?= n
 TS_FW_UPDATE			?= n
+TS_UEFI_AUTH_VAR 		?= y
+TS_UEFI_INTERNAL_CRYPTO	?= n
 # Supported values: embedded, fip
 SP_PACKAGING_METHOD		?= embedded
 SPMC_TESTS			?= n
+SPMC_AT_EL			?= 1
+
+# Behaves a similar way like BRANCH_PROTECTION in TF-A:
+# unset: Default value. mbranch-protection flag is not provided
+# 0: Turns off all types of branch protection
+# 1: Enables all types of branch protection features
+# 2: Return address signing to its standard level
+# 3: Extend the signing to include leaf functions
+# 4: Turn on branch target identification mechanism
+TS_BRANCH_PROTECTION		?= unset
+BRANCH_PROTECTION_OPTIONS	:= unset 0 1 2 3 4
+
+ifeq ($(filter $(TS_BRANCH_PROTECTION),$(BRANCH_PROTECTION_OPTIONS)),)
+  $(error TS_BRANCH_PROTECTION is not set to a valid option)
+endif
+
+ifneq ($(TS_UEFI_AUTH_VAR)-$(TS_SMM_GATEWAY),y-y)
+SP_SMM_GATEWAY_EXTRA_FLAGS += -DUEFI_AUTH_VAR=OFF
+TS_APP_UEFI_TEST_EXTRA_FLAGS += -DUEFI_AUTH_VAR=OFF
+endif
+
+ifeq ($(TS_UEFI_INTERNAL_CRYPTO),y)
+SP_SMM_GATEWAY_EXTRA_FLAGS += -DUEFI_INTERNAL_CRYPTO=ON
+endif
 
 # Enable the "HArdware Volatile Entropy Gathering and Expansion" daemon to
 # overcome low-entropy conditions in the FVP
@@ -38,15 +65,7 @@ SP_PSA_CRYPTO_CONFIG		?= $(DEFAULT_SP_CONFIG)
 SP_PSA_ATTESTATION_CONFIG	?= $(DEFAULT_SP_CONFIG)
 SP_SMM_GATEWAY_CONFIG		?= $(DEFAULT_SP_CONFIG)
 SP_FWU_CONFIG			?= $(DEFAULT_SP_CONFIG)
-
-TF_A_FLAGS ?= \
-	BL32=$(OPTEE_OS_PAGER_V2_BIN) \
-	BL33=$(EDK2_BIN) \
-	PLAT=fvp \
-	SPD=spmd \
-	SPMD_SPM_AT_SEL2=0 \
-	ARM_SPMC_MANIFEST_DTS=$(ROOT)/build/fvp/spmc_manifest.dts \
-	$(TF_A_FIP_SP_FLAGS)
+SP_LOGGING_CONFIG		?= $(DEFAULT_SP_CONFIG)
 
 LINUX_DEFCONFIG_COMMON_FILES ?= $(CURDIR)/kconfigs/fvp_trusted-services.conf
 
@@ -63,6 +82,7 @@ ifeq ($(SP_PACKAGING_METHOD),fip)
 $(eval $(call add-dtc-define,SPMC_TESTS))
 $(eval $(call add-dtc-define,TS_SMM_GATEWAY))
 $(eval $(call add-dtc-define,TS_FW_UPDATE))
+$(eval $(call add-dtc-define,TS_LOGGING_SP))
 
 TF_A_EXPORTS += DTC_CPPFLAGS="$(DTC_CPPFLAGS)"
 endif
@@ -74,10 +94,40 @@ OPTEE_OS_COMMON_EXTRA_FLAGS += \
 	CFG_DT=y \
 	CFG_MAP_EXT_DT_SECURE=y
 
+# If branch protection is unset, do not pass it
+ifeq ($(filter $(TS_BRANCH_PROTECTION),unset),)
+TF_A_FLAGS              += BRANCH_PROTECTION=$(TS_BRANCH_PROTECTION)
+TS_APP_COMMON_FLAGS	+= -DBRANCH_PROTECTION=$(TS_BRANCH_PROTECTION)
+SP_COMMON_FLAGS		+= -DBRANCH_PROTECTION=$(TS_BRANCH_PROTECTION)
+endif
+
+# Branch Target Identification enablement
+ifneq ($(filter $(TS_BRANCH_PROTECTION),1 4),)
+OPTEE_OS_COMMON_EXTRA_FLAGS += CFG_CORE_BTI=y
+OPTEE_OS_COMMON_EXTRA_FLAGS += CFG_TA_BTI=y
+
+FVP_EXTRA_ARGS += -C cluster0.has_branch_target_exception=2
+FVP_EXTRA_ARGS += -C cluster1.has_branch_target_exception=2
+FVP_EXTRA_ARGS += -C cluster0.has_arm_v8-5=1
+FVP_EXTRA_ARGS += -C cluster1.has_arm_v8-5=1
+endif
+
+# Pointer Authentication enablement
+ifneq ($(filter $(TS_BRANCH_PROTECTION),1 2 3),)
+OPTEE_OS_COMMON_EXTRA_FLAGS += CFG_CORE_PAUTH=y
+OPTEE_OS_COMMON_EXTRA_FLAGS += CFG_TA_PAUTH=y
+
+FVP_EXTRA_ARGS += -C cluster0.has_pointer_authentication=2
+FVP_EXTRA_ARGS += -C cluster1.has_pointer_authentication=2
+endif
 
 # The boot order of the SPs is determined by the order of calls here. This is
 # due to the SPMC not (yet) supporting the boot order field of the SP manifest.
 ifeq ($(SPMC_TESTS),n)
+# LOGGING SP
+ifeq ($(TS_LOGGING_SP),y)
+$(eval $(call build-sp,logging,config/$(SP_LOGGING_CONFIG),da9dffbd-d590-40ed-975f-19c65a3d52d3,$(SP_LOGGING_EXTRA_FLAGS)))
+endif
 # PSA SPs
 $(eval $(call build-sp,block-storage,config/$(SP_BLOCK_STORAGE_CONFIG),63646e80-eb52-462f-ac4f-8cdf3987519c,$(SP_BLOCK_STORAGE_EXTRA_FLAGS)))
 $(eval $(call build-sp,internal-trusted-storage,config/$(SP_PSA_ITS_CONFIG),dc1eef48-b17a-4ccf-ac8b-dfcff7711b14,$(SP_PSA_ITS_EXTRA_FLAGS)))
@@ -103,16 +153,17 @@ endif
 
 # Linux user space applications
 ifeq ($(SPMC_TESTS),n)
-$(eval $(call build-ts-app,libts))
-$(eval $(call build-ts-app,ts-service-test))
-$(eval $(call build-ts-app,psa-api-test/internal_trusted_storage))
-$(eval $(call build-ts-app,psa-api-test/protected_storage))
-$(eval $(call build-ts-app,psa-api-test/crypto))
+$(eval $(call build-ts-app,libts,$(TS_APP_LIBTS_EXTRA_FLAGS)))
+$(eval $(call build-ts-app,libpsats,$(TS_APP_LIBPSATS_EXTRA_FLAGS)))
+$(eval $(call build-ts-app,ts-service-test,$(TS_APP_TS_SERVICE_TEST_EXTRA_FLAGS)))
+$(eval $(call build-ts-app,psa-api-test/internal_trusted_storage,$(TS_APP_PSA_ITS_EXTRA_FLAGS)))
+$(eval $(call build-ts-app,psa-api-test/protected_storage,$(TS_APP_PSA_PS_EXTRA_FLAGS)))
+$(eval $(call build-ts-app,psa-api-test/crypto,$(TS_APP_PSA_CRYPTO_EXTRA_FLAGS)))
 ifeq ($(MEASURED_BOOT),y)
-$(eval $(call build-ts-app,psa-api-test/initial_attestation))
+$(eval $(call build-ts-app,psa-api-test/initial_attestation,$(TS_APP_PSA_IAT_EXTRA_FLAGS)))
 endif
 ifeq ($(TS_UEFI_TESTS),y)
-$(eval $(call build-ts-app,uefi-test))
+$(eval $(call build-ts-app,uefi-test,$(TS_APP_UEFI_TEST_EXTRA_FLAGS)))
 
 # uefi-test uses MM Communicate via the arm-ffa-user driver and the message
 # payload is forwarded in a carveout memory area. Adding reserved-memory node to
@@ -138,7 +189,7 @@ endif
 ifeq ($(TS_FW_UPDATE),y)
 
 # TODO: the fwu-tool is currently not needed.
-$(eval $(call  build-ts-host-app,fwu-tool))
+$(eval $(call build-ts-host-app,fwu-tool,$(TS_HOST_UEFI_TEST_EXTRA_FLAGS)))
 
 ffa-fwu-sp: ts-host-fwu-tool
 
@@ -159,6 +210,6 @@ ffa-fwu-fash-img-clean:
 
 clean: ffa-fwu-fash-img-clean
 
-clean: ts-host-all-clean ffa-test-all-clean ffa-sp-all-clean linux-arm-ffa-tee-clean linux-arm-ffa-user-clean
+clean: ts-host-all-clean ffa-test-all-clean ffa-sp-all-clean linux-arm-ffa-user-clean
 
 endif

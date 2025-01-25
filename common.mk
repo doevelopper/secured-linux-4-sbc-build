@@ -37,7 +37,9 @@ OPTEE_CLIENT_PATH		?= $(ROOT)/optee_client
 OPTEE_TEST_PATH			?= $(ROOT)/optee_test
 OPTEE_EXAMPLES_PATH		?= $(ROOT)/optee_examples
 OPTEE_RUST_PATH			?= $(ROOT)/optee_rust
+OPTEE_FTPM_PATH			?= $(ROOT)/optee_ftpm
 BUILDROOT_TARGET_ROOT		?= $(ROOT)/out-br/target
+MS_TPM_20_REF_PATH		?= $(ROOT)/ms-tpm-20-ref
 
 # default high verbosity. slow uarts shall specify lower if prefered
 CFG_TEE_CORE_LOG_LEVEL		?= 3
@@ -45,11 +47,18 @@ CFG_TEE_CORE_LOG_LEVEL		?= 3
 # optee_test
 WITH_TLS_TESTS			?= y
 ifneq ($(COMPILER),clang)
-# assuming GCC toolchain from toolchain.mk
+ifeq ($(UNAME_M),x86_64)
+# assuming GCC toolchain from toolchain.mk (GCC <= 11)
 WITH_CXX_TESTS			?= y
 endif
+endif
 
-CCACHE ?= $(shell which ccache) # Don't remove this comment (space is needed)
+# Only set CCACHE if it's pointing to something to avoid prefixing CROSS_COMPILE
+# with whitespace. TF-A will not build with whitespace first in CROSS_COMPILE.
+CCACHE_present := $(shell which ccache)
+ifneq ($(CCACHE_present),)
+CCACHE ?= $(CCACHE_present) # Don't remove this comment (space is needed)
+endif
 
 # QEMU shared folders settings
 #
@@ -57,7 +66,7 @@ CCACHE ?= $(shell which ccache) # Don't remove this comment (space is needed)
 # 1) make QEMU_VIRTFS_AUTOMOUNT=y run
 #    will mount the project's root on the host as /mnt/host in QEMU.
 # 2) mkdir -p /tmp/qemu-data-tee && make QEMU_PSS_AUTOMOUNT=y run
-#    will mount the host directory /tmp/qemu-data-tee as /data/tee
+#    will mount the host directory /tmp/qemu-data-tee as /var/lib/tee
 #    in QEMU, thus creating persistent secure storage.
 
 ifeq ($(QEMU_VIRTFS_AUTOMOUNT),y)
@@ -83,7 +92,7 @@ QEMU_VIRTFS_HOST_DIR	?= $(ROOT)
 # Persistent Secure Storage via shared folder
 # # Set QEMU_PSS_ENABLE to 'y' and adjust QEMU_PSS_HOST_DIR
 # # Then in QEMU, run:
-# # $ mount -t 9p -o trans=virtio secure /data/tee
+# # $ mount -t 9p -o trans=virtio secure /var/lib/tee
 # # Or enable QEMU_PSS_AUTOMOUNT
 QEMU_PSS_ENABLE		?= n
 QEMU_PSS_HOST_DIR	?= /tmp/qemu-data-tee
@@ -256,17 +265,21 @@ BUILDROOT_TOOLCHAIN=toolchain-riscv$(COMPILE_NS_USER)
 endif
 else ifeq ($(UNAME_M),aarch64)
 ifeq ($(COMPILE_NS_USER),64)
-BUILDROOT_TOOLCHAIN=toolchain-aarch64-sdk
+BUILDROOT_TOOLCHAIN=toolchain-aarch64-sdk toolchain-common-sdk
 else
 BUILDROOT_TOOLCHAIN=toolchain-aarch32
 endif
 else
-BUILDROOT_TOOLCHAIN=toolchain-aarch$(COMPILE_NS_USER)-sdk
+BUILDROOT_TOOLCHAIN=toolchain-aarch$(COMPILE_NS_USER)-sdk toolchain-common-sdk
 endif
 endif
 
 ifeq ($(XEN_BOOT),y)
 DEFCONFIG_XEN=--br-defconfig build/br-ext/configs/xen.conf
+endif
+
+ifeq ($(MEASURED_BOOT_FTPM),y)
+DEFCONFIG_TSS ?= --br-defconfig build/br-ext/configs/tss
 endif
 
 BR2_PER_PACKAGE_DIRECTORIES ?= y
@@ -342,7 +355,8 @@ buildroot: optee-os
 		--top-dir "$(ROOT)" \
 		--br-defconfig build/br-ext/configs/optee_$(BUILDROOT_ARCH) \
 		--br-defconfig build/br-ext/configs/optee_generic \
-		--br-defconfig build/br-ext/configs/$(BUILDROOT_TOOLCHAIN) \
+		$(addprefix --br-defconfig build/br-ext/configs/, \
+			    $(BUILDROOT_TOOLCHAIN)) \
 		$(DEFCONFIG_GDBSERVER) \
 		$(DEFCONFIG_XEN) \
 		$(DEFCONFIG_TSS) \
@@ -421,11 +435,11 @@ QEMU_EXTRA_ARGS +=\
 
 ifeq ($(QEMU_VIRTFS_ENABLE),y)
 QEMU_CONFIGURE_PARAMS_COMMON +=  --enable-virtfs
-QEMU_EXTRA_ARGS +=\
+QEMU_RUN_ARGS_COMMON +=\
 	-fsdev local,id=fsdev0,path=$(QEMU_VIRTFS_HOST_DIR),security_model=none \
 	-device virtio-9p-device,fsdev=fsdev0,mount_tag=host
 ifeq ($(QEMU_PSS_ENABLE),y)
-QEMU_EXTRA_ARGS +=\
+QEMU_RUN_ARGS_COMMON +=\
 	  -fsdev local,id=fsdev1,path=$(QEMU_PSS_HOST_DIR),security_model=mapped-xattr \
 	  -device virtio-9p-device,fsdev=fsdev1,mount_tag=secure
 endif
@@ -455,9 +469,25 @@ define launch-terminal
 		$(LAUNCH_TERMINAL) "$(BUILD_PATH)/soc_term.py $(1)" &
 endef
 else
+tmux := $(TMUX)
+tmux_window := $(shell echo OPTEE_$$RANDOM)
 gnome-terminal := $(shell command -v gnome-terminal 2>/dev/null)
 konsole := $(shell command -v konsole 2>/dev/null)
 xterm := $(shell command -v xterm 2>/dev/null)
+
+ifdef tmux
+define launch-terminal
+	@if tmux list-windows -F '#W' | grep -q $(tmux_window); then \
+		nc -z 127.0.0.1 $(1) || \
+			tmux split-window -d -h -t $(tmux_window) "$(BUILD_PATH)/soc_term.py $(1)" ; \
+	else \
+		nc -z 127.0.0.1 $(1) || \
+			tmux new-window -d -n $(tmux_window) "$(BUILD_PATH)/soc_term.py $(1)" ; \
+	fi
+
+	@echo "* $(2)'s terminal has been spawned in $(tmux_window)."
+endef
+else
 ifdef gnome-terminal
 define launch-terminal
 	@nc -z  127.0.0.1 $(1) || \
@@ -476,11 +506,12 @@ define launch-terminal
 	$(xterm) -title $(2) -e $(BASH) -c "$(BUILD_PATH)/soc_term.py $(1)" &
 endef
 else
-check-terminal := @echo "Error: could not find gnome-terminal, konsole nor xterm" ; false
-endif
-endif
-endif
-endif
+check-terminal := @echo "Error: could not find tmux, gnome-terminal, konsole nor xterm" ; false
+endif # xterm
+endif # konsole
+endif # gnome-terminal
+endif # tmux
+endif # LAUNCH_TERMINAL
 
 define wait-for-ports
 	@while ! nc -z 127.0.0.1 $(1) || ! nc -z 127.0.0.1 $(2); do sleep 1; done
@@ -496,12 +527,7 @@ OPTEE_OS_COMMON_EXTRA_FLAGS	+= CFG_USER_TA_TARGETS=ta_arm32
 endif
 ifeq ($(COMPILE_S_USER),64)
 OPTEE_OS_TA_DEV_KIT_DIR	?= $(OPTEE_OS_PATH)/out/arm/export-ta_arm64
-ifeq ($(MEASURED_BOOT_FTPM),y)
-# The fTPM TA can only be built for 32-bit so enable the 32-bit libraries as well
-OPTEE_OS_COMMON_EXTRA_FLAGS	+= CFG_USER_TA_TARGETS="ta_arm64 ta_arm32"
-else
 OPTEE_OS_COMMON_EXTRA_FLAGS	+= CFG_USER_TA_TARGETS=ta_arm64
-endif
 endif
 
 ifeq ($(COMPILE_S_KERNEL),64)
@@ -547,6 +573,11 @@ OPTEE_OS_COMMON_FLAGS ?= \
 	CFG_IN_TREE_EARLY_TAS="$(CFG_IN_TREE_EARLY_TAS)"
 
 .PHONY: optee-os-common
+ifeq ($(MEASURED_BOOT_FTPM),y)
+OPTEE_OS_COMMON_EXTRA_FLAGS += EARLY_TA_PATHS=$(OPTEE_FTPM_PATH)/out/bc50d971-d4c9-42c4-82cb-343fb7f37896.stripped.elf
+optee-os-common: ftpm
+endif
+
 optee-os-common:
 	$(MAKE) -C $(OPTEE_OS_PATH) $(OPTEE_OS_COMMON_FLAGS)
 
@@ -562,26 +593,23 @@ optee-os-devkit:
 # fTPM Rules
 ################################################################################
 
-# The fTPM implementation is based on ARM32 architecture whereas the rest of the
-# system is built to run on 64-bit mode (COMPILE_S_USER = 64). Therefore set
-# TA_DEV_KIT_DIR manually to the arm32 OPTEE toolkit rather than relying on
-# OPTEE_OS_TA_DEV_KIT_DIR variable.
 FTPM_FLAGS ?= 						\
-	TA_CPU=cortex-a9				\
-	TA_CROSS_COMPILE=$(AARCH32_CROSS_COMPILE)	\
-	TA_DEV_KIT_DIR=$(OPTEE_OS_PATH)/out/arm/export-ta_arm32 \
-	CFG_TA_DEBUG=y CFG_TEE_TA_LOG_LEVEL=4 CFG_TA_MEASURED_BOOT=y
+	CROSS_COMPILE=$(CROSS_COMPILE_S_USER)	\
+	TA_DEV_KIT_DIR=$(OPTEE_OS_TA_DEV_KIT_DIR) \
+	CFG_MS_TPM_20_REF=$(MS_TPM_20_REF_PATH) \
+	CFG_TA_MEASURED_BOOT=y $(if $(filter 1,$(DEBUG)),CFG_TA_DEBUG=y) \
+	O=out
 
 .PHONY: ftpm
 ftpm:
 ifeq ($(MEASURED_BOOT_FTPM),y)
 ftpm: optee-os-devkit
-	$(FTPM_FLAGS) $(MAKE) -C $(FTPM_PATH)
+	$(FTPM_FLAGS) $(MAKE) -C $(OPTEE_FTPM_PATH)
 endif
 
 .PHONY: ftpm-clean
 ftpm-clean:
 ifeq ($(MEASURED_BOOT_FTPM),y)
 ftpm-clean:
-	-$(FTPM_FLAGS) $(MAKE) -C $(FTPM_PATH) clean
+	-$(FTPM_FLAGS) $(MAKE) -C $(OPTEE_FTPM_PATH) clean
 endif

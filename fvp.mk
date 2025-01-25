@@ -37,41 +37,37 @@ ifeq ($(MEASURED_BOOT),y)
 # Prefer release mode for TF-A if using Measured Boot, debug may exhaust memory.
 TF_A_BUILD		?= release
 endif
-ifeq ($(DEBUG),1)
+TF_A_DEBUG		?= $(DEBUG)
+ifeq ($(TF_A_DEBUG),1)
+TF_A_LOGLVL		?= 40
 TF_A_BUILD		?= debug
 else
+TF_A_LOGLVL 		?= 20
 TF_A_BUILD		?= release
 endif
-EDK2_PATH		?= $(ROOT)/edk2
-EDK2_PLATFORMS_PATH	?= $(ROOT)/edk2-platforms
-EDK2_TOOLCHAIN		?= GCC49
-EDK2_ARCH		?= AARCH64
-ifeq ($(DEBUG),1)
-EDK2_BUILD		?= DEBUG
-else
-EDK2_BUILD		?= RELEASE
-endif
-EDK2_BIN		?= $(EDK2_PLATFORMS_PATH)/Build/ArmVExpress-FVP-AArch64/$(EDK2_BUILD)_$(EDK2_TOOLCHAIN)/FV/FVP_$(EDK2_ARCH)_EFI.fd
-FVP_USE_BASE_PLAT	?= n
-ifeq ($(FVP_USE_BASE_PLAT),y)
 FVP_PATH		?= $(ROOT)/Base_RevC_AEMvA_pkg/models/Linux64_GCC-9.3
 FVP_BIN			?= FVP_Base_RevC-2xAEMvA
 FVP_LINUX_DTB		?= $(LINUX_PATH)/arch/arm64/boot/dts/arm/fvp-base-revc.dtb
-else
-FVP_PATH		?= $(ROOT)/Foundation_Platformpkg/models/Linux64_GCC-9.3
-FVP_BIN			?= Foundation_Platform
-FVP_LINUX_DTB		?= $(LINUX_PATH)/arch/arm64/boot/dts/arm/foundation-v8-gicv3-psci.dtb
-endif
-ifeq ($(wildcard $(FVP_PATH)),)
-$(error $(FVP_PATH) does not exist)
-endif
-GRUB_PATH		?= $(ROOT)/grub
-GRUB_CONFIG_PATH	?= $(BUILD_PATH)/fvp/grub
 OUT_PATH		?= $(ROOT)/out
-BINARIES_PATH	?= $(ROOT)/out/bin
-GRUB_BIN		?= $(OUT_PATH)/bootaa64.efi
+BINARIES_PATH		?= $(ROOT)/out/bin
+UBOOT_PATH		?= $(ROOT)/u-boot
+UBOOT_BIN		?= $(UBOOT_PATH)/u-boot.bin
+MKIMAGE_PATH		?= $(UBOOT_PATH)/tools
+HAFNIUM_PATH		?= $(ROOT)/hafnium
+HAFNIUM_BIN		?= $(HAFNIUM_PATH)/out/reference/secure_aem_v8a_fvp_vhe_clang/hafnium.bin
+UBOOT_BOOT_SCRIPT	?= $(OUT_PATH)/boot.scr
 BOOT_IMG		?= $(OUT_PATH)/boot-fat.uefi.img
 FTPM_PATH		?= $(ROOT)/ms-tpm-20-ref/Samples/ARM32-FirmwareTPM/optee_ta
+
+# Option to configure FF-A and SPM:
+# n:	disabled
+# 3:	not supported, SPMC and SPMD at EL3 (in TF-A)
+# 2:	SPMC at S-EL2 (in Hafnium), SPMD at EL3 (in TF-A)
+# 1:	SPMC at S-EL1 (in OP-TEE), SPMD at EL3 (in TF-A)
+SPMC_AT_EL ?= n
+ifneq ($(filter-out n 1 2,$(SPMC_AT_EL)),)
+$(error Unsupported SPMC_AT_EL value $(SPMC_AT_EL))
+endif
 
 ifeq ($(MEASURED_BOOT),y)
 # By default enable FTPM for backwards compatibility.
@@ -90,9 +86,8 @@ endif
 ################################################################################
 # Targets
 ################################################################################
-all: arm-tf optee-os ftpm boot-img linux edk2
-clean: arm-tf-clean boot-img-clean buildroot-clean edk2-clean grub-clean \
-	ftpm-clean optee-os-clean
+all: arm-tf optee-os ftpm boot-img linux u-boot
+clean: arm-tf-clean boot-img-clean buildroot-clean ftpm-clean optee-os-clean u-boot-clean
 
 include toolchain.mk
 
@@ -120,12 +115,17 @@ FVP_VIRTFS_HOST_DIR	?= $(ROOT)
 FVP_VIRTFS_AUTOMOUNT	?= n
 FVP_VIRTFS_MOUNTPOINT	?= /mnt/host
 
-ifeq ($(FVP_VIRTFS_AUTOMOUNT),y)
-$(call force,FVP_VIRTFS_ENABLE,y,required by FVP_VIRTFS_AUTOMOUNT)
+ifeq ($(SPMC_AT_EL),2)
+BL32_DEPS		?= hafnium optee-os
+else
+BL32_DEPS		?= optee-os
 endif
 
-ifneq ($(FVP_USE_BASE_PLAT),y)
-$(call force,FVP_VIRTFS_ENABLE,n,only supported on FVP Base Platform)
+BL33_BIN		?= $(UBOOT_BIN)
+BL33_DEPS		?= u-boot
+
+ifeq ($(FVP_VIRTFS_AUTOMOUNT),y)
+$(call force,FVP_VIRTFS_ENABLE,y,required by FVP_VIRTFS_AUTOMOUNT)
 endif
 
 BR2_ROOTFS_POST_BUILD_SCRIPT = $(ROOT)/build/br-ext/board/fvp/post-build.sh
@@ -138,21 +138,16 @@ TF_A_EXPORTS ?= \
 	CROSS_COMPILE="$(CCACHE)$(AARCH64_CROSS_COMPILE)"
 
 TF_A_FLAGS ?= \
-	BL32=$(OPTEE_OS_HEADER_V2_BIN) \
-	BL32_EXTRA1=$(OPTEE_OS_PAGER_V2_BIN) \
-	BL32_EXTRA2=$(OPTEE_OS_PAGEABLE_V2_BIN) \
-	BL33=$(EDK2_BIN) \
-	ARM_TSP_RAM_LOCATION=tdram \
+	BL33=$(UBOOT_BIN) \
 	FVP_USE_GIC_DRIVER=FVP_GICV3 \
 	PLAT=fvp \
-	SPD=opteed
+	DEBUG=$(TF_A_DEBUG) \
+	LOG_LEVEL=$(TF_A_LOGLVL)
 
 ifneq ($(MEASURED_BOOT),y)
-	TF_A_FLAGS += DEBUG=$(DEBUG) \
-		          MEASURED_BOOT=0
+	TF_A_FLAGS += MEASURED_BOOT=0
 else
-	TF_A_FLAGS += DEBUG=0 \
-		      MBEDTLS_DIR=$(ROOT)/mbedtls  \
+	TF_A_FLAGS += MBEDTLS_DIR=$(ROOT)/mbedtls  \
 		      ARM_ROTPK_LOCATION=devel_rsa \
 		      GENERATE_COT=1 \
 		      MEASURED_BOOT=1 \
@@ -162,28 +157,30 @@ else
 		      EVENT_LOG_LEVEL=20
 endif
 
-arm-tf: optee-os edk2
+TF_A_FLAGS_BL32_OPTEE  = BL32=$(OPTEE_OS_HEADER_V2_BIN)
+TF_A_FLAGS_BL32_OPTEE += BL32_EXTRA1=$(OPTEE_OS_PAGER_V2_BIN)
+TF_A_FLAGS_BL32_OPTEE += BL32_EXTRA2=$(OPTEE_OS_PAGEABLE_V2_BIN)
+TF_A_FLAGS_BL32_OPTEE += ARM_TSP_RAM_LOCATION=tdram
+
+TF_A_FLAGS_SPMC_AT_EL_n  = $(TF_A_FLAGS_BL32_OPTEE) SPD=opteed
+TF_A_FLAGS_SPMC_AT_EL_1  = BL32=$(OPTEE_OS_PAGER_V2_BIN) SPD=spmd
+TF_A_FLAGS_SPMC_AT_EL_1 += CTX_INCLUDE_EL2_REGS=0 SPMD_SPM_AT_SEL2=0
+TF_A_FLAGS_SPMC_AT_EL_1 += ARM_SPMC_MANIFEST_DTS=../build/fvp/spmc_el1_partitions_manifest.dts
+TF_A_FLAGS_SPMC_AT_EL_1 += SPMC_OPTEE=1
+TF_A_FLAGS_SPMC_AT_EL_2  = SPD=spmd
+TF_A_FLAGS_SPMC_AT_EL_2 += SP_LAYOUT_FILE=../build/fvp/sp_layout.json
+TF_A_FLAGS_SPMC_AT_EL_2 += BL32=$(HAFNIUM_BIN)
+TF_A_FLAGS_SPMC_AT_EL_2 += ARM_SPMC_MANIFEST_DTS=../build/fvp/spmc_el2_optee_sp_manifest.dts
+TF_A_FLAGS_SPMC_AT_EL_2 += BRANCH_PROTECTION=1
+TF_A_FLAGS_SPMC_AT_EL_2 += ENABLE_FEAT_MTE2=1
+
+TF_A_FLAGS += $(TF_A_FLAGS_SPMC_AT_EL_$(SPMC_AT_EL))
+
+arm-tf: $(BL32_DEPS) $(BL33_DEPS)
 	$(TF_A_EXPORTS) $(MAKE) -C $(TF_A_PATH) $(TF_A_FLAGS) all fip
 
 arm-tf-clean:
 	$(TF_A_EXPORTS) $(MAKE) -C $(TF_A_PATH) $(TF_A_FLAGS) clean
-
-################################################################################
-# EDK2 / Tianocore
-################################################################################
-define edk2-env
-	export WORKSPACE=$(EDK2_PLATFORMS_PATH)
-endef
-
-define edk2-call
-	$(EDK2_TOOLCHAIN)_$(EDK2_ARCH)_PREFIX=$(AARCH64_CROSS_COMPILE) \
-	build -n `getconf _NPROCESSORS_ONLN` -a $(EDK2_ARCH) \
-		-t $(EDK2_TOOLCHAIN) -p Platform/ARM/VExpressPkg/ArmVExpress-FVP-AArch64.dsc -b $(EDK2_BUILD)
-endef
-
-edk2: edk2-common
-
-edk2-clean: edk2-clean-common
 
 ################################################################################
 # Linux kernel
@@ -221,6 +218,12 @@ linux-cleaner: linux-cleaner-common
 # OP-TEE
 ################################################################################
 OPTEE_OS_COMMON_FLAGS += CFG_ARM_GICV3=y
+OPTEE_OS_COMMON_FLAGS_SPMC_AT_EL_1 = CFG_CORE_SEL1_SPMC=y
+OPTEE_OS_COMMON_FLAGS_SPMC_AT_EL_2 = CFG_CORE_SEL2_SPMC=y
+OPTEE_OS_COMMON_FLAGS_SPMC_AT_EL_2 += CFG_ARM_GICV3=n CFG_CORE_HAFNIUM_INTC=y
+OPTEE_OS_COMMON_FLAGS_SPMC_AT_EL_2 += CFG_CORE_WORKAROUND_NSITR_CACHE_PRIME=n
+
+OPTEE_OS_COMMON_FLAGS += $(OPTEE_OS_COMMON_FLAGS_SPMC_AT_EL_$(SPMC_AT_EL))
 
 ifeq ($(MEASURED_BOOT),y)
 	OPTEE_OS_COMMON_FLAGS += CFG_DT=y CFG_CORE_TPM_EVENT_LOG=y
@@ -231,66 +234,68 @@ optee-os: optee-os-common
 optee-os-clean: ftpm-clean optee-os-clean-common
 
 ################################################################################
+# Hafnium
+################################################################################
+
+HAFNIUM_EXPORTS = PATH=$(TOOLCHAIN_ROOT)/clang-$(CLANG_BUILD_VER)/bin:$(PATH)
+
+.hafnium_checkout:
+	git -C $(HAFNIUM_PATH) submodule update --init
+	touch $@
+
+hafnium: $(HAFNIUM_BIN)
+
+$(HAFNIUM_BIN): .hafnium_checkout | $(OUT_PATH)
+	$(HAFNIUM_EXPORTS) $(MAKE) -C $(HAFNIUM_PATH) $(HAFNIUM_FLAGS) PLATFORM=secure_aem_v8a_fvp_vhe
+
+
+################################################################################
 # Buildroot
 ################################################################################
 
 buildroot: linux-ftpm-module
 
 ################################################################################
-# grub
+# U-Boot
 ################################################################################
-grub-flags := CC="$(CCACHE)gcc" \
-	TARGET_CC="$(AARCH64_CROSS_COMPILE)gcc" \
-	TARGET_OBJCOPY="$(AARCH64_CROSS_COMPILE)objcopy" \
-	TARGET_NM="$(AARCH64_CROSS_COMPILE)nm" \
-	TARGET_RANLIB="$(AARCH64_CROSS_COMPILE)ranlib" \
-	TARGET_STRIP="$(AARCH64_CROSS_COMPILE)strip" \
-	--disable-werror
+UBOOT_DEFCONFIG_FILES := $(ROOT)/build/kconfigs/u-boot_fvp.conf
 
-GRUB_MODULES += boot chain configfile echo efinet eval ext2 fat font gettext \
-		gfxterm gzio help linux loadenv lsefi normal part_gpt \
-		part_msdos read regexp search search_fs_file search_fs_uuid \
-		search_label terminal terminfo test tftp time
+UBOOT_COMMON_FLAGS ?= CROSS_COMPILE=$(CROSS_COMPILE_NS_KERNEL)
 
-$(GRUB_PATH)/configure: $(GRUB_PATH)/configure.ac
-	cd $(GRUB_PATH) && ./autogen.sh
+$(UBOOT_PATH)/.config: $(UBOOT_DEFCONFIG_FILES)
+	cd $(UBOOT_PATH) && scripts/kconfig/merge_config.sh $(UBOOT_DEFCONFIG_FILES)
 
-$(GRUB_PATH)/Makefile: $(GRUB_PATH)/configure
-	cd $(GRUB_PATH) && ./configure --target=aarch64 --enable-boot-time $(grub-flags)
+.PHONY: u-boot-defconfig
+u-boot-defconfig: $(UBOOT_PATH)/.config
 
-.PHONY: grub
-grub: $(GRUB_PATH)/Makefile | $(OUT_PATH)
-	$(MAKE) -C $(GRUB_PATH) && \
-	cd $(GRUB_PATH) && ./grub-mkimage \
-		--output=$(GRUB_BIN) \
-		--config=$(GRUB_CONFIG_PATH)/grub.cfg \
-		--format=arm64-efi \
-		--directory=grub-core \
-		--prefix=/boot/grub \
-		$(GRUB_MODULES)
+.PHONY: u-boot
+u-boot: u-boot-defconfig
+	$(MAKE) -C $(UBOOT_PATH) $(UBOOT_COMMON_FLAGS)
 
-.PHONY: grub-clean
-grub-clean:
-	@if [ -e $(GRUB_PATH)/Makefile ]; then $(MAKE) -C $(GRUB_PATH) clean; fi
-	@rm -f $(GRUB_BIN)
-	@rm -f $(GRUB_PATH)/configure
+.PHONY: u-boot-clean
+u-boot-clean:
+	$(MAKE) -C $(UBOOT_PATH) $(UBOOT_COMMON_FLAGS) distclean
 
+$(UBOOT_BOOT_SCRIPT): $(BUILD_PATH)/fvp/uboot_boot_cmd.txt u-boot | $(OUT_PATH)
+	$(MKIMAGE_PATH)/mkimage -A arm64 \
+				-O linux \
+				-T script \
+				-C none \
+				-d $(BUILD_PATH)/fvp/uboot_boot_cmd.txt \
+				$(UBOOT_BOOT_SCRIPT)
 
 ################################################################################
 # Boot Image
 ################################################################################
 
 .PHONY: boot-img
-boot-img: grub buildroot
+boot-img: buildroot u-boot $(UBOOT_BOOT_SCRIPT)
 	rm -f $(BOOT_IMG)
 	mformat -i $(BOOT_IMG) -n 64 -h 255 -T 131072 -v "BOOT IMG" -C ::
 	mcopy -i $(BOOT_IMG) $(LINUX_PATH)/arch/arm64/boot/Image ::
 	mcopy -i $(BOOT_IMG) $(FVP_LINUX_DTB) ::/fvp.dtb
-	mmd -i $(BOOT_IMG) ::/EFI
-	mmd -i $(BOOT_IMG) ::/EFI/BOOT
 	mcopy -i $(BOOT_IMG) $(ROOT)/out-br/images/rootfs.cpio.gz ::/initrd.img
-	mcopy -i $(BOOT_IMG) $(GRUB_BIN) ::/EFI/BOOT/bootaa64.efi
-	mcopy -i $(BOOT_IMG) $(GRUB_CONFIG_PATH)/grub.cfg ::/EFI/BOOT/grub.cfg
+	mcopy -i $(BOOT_IMG) $(UBOOT_BOOT_SCRIPT) ::
 
 .PHONY: boot-img-clean
 boot-img-clean:
@@ -303,25 +308,24 @@ boot-img-clean:
 run: all
 	$(MAKE) run-only
 
-ifeq ($(FVP_USE_BASE_PLAT),y)
 FVP_ARGS ?= \
 	-C bp.ve_sysregs.exit_on_shutdown=1 \
 	-C cache_state_modelled=0 \
 	-C pctl.startup=0.0.0.0 \
 	-C cluster0.NUM_CORES=4 \
-	-C cluster1.NUM_CORES=4 \
 	-C cluster0.cpu0.enable_crc32=1 \
 	-C cluster0.cpu1.enable_crc32=1 \
 	-C cluster0.cpu2.enable_crc32=1 \
 	-C cluster0.cpu3.enable_crc32=1 \
-	-C cluster1.cpu0.enable_crc32=1 \
-	-C cluster1.cpu1.enable_crc32=1 \
-	-C cluster1.cpu2.enable_crc32=1 \
-	-C cluster1.cpu3.enable_crc32=1 \
 	-C cluster0.cpu0.semihosting-cwd="$(BINARIES_PATH)" \
 	-C cluster0.cpu1.semihosting-cwd="$(BINARIES_PATH)" \
 	-C cluster0.cpu2.semihosting-cwd="$(BINARIES_PATH)" \
 	-C cluster0.cpu3.semihosting-cwd="$(BINARIES_PATH)" \
+	-C cluster1.NUM_CORES=4 \
+	-C cluster1.cpu0.enable_crc32=1 \
+	-C cluster1.cpu1.enable_crc32=1 \
+	-C cluster1.cpu2.enable_crc32=1 \
+	-C cluster1.cpu3.enable_crc32=1 \
 	-C cluster1.cpu0.semihosting-cwd="$(BINARIES_PATH)" \
 	-C cluster1.cpu1.semihosting-cwd="$(BINARIES_PATH)" \
 	-C cluster1.cpu2.semihosting-cwd="$(BINARIES_PATH)" \
@@ -330,19 +334,59 @@ FVP_ARGS ?= \
 	-C bp.secureflashloader.fname=$(TF_A_PATH)/build/fvp/$(TF_A_BUILD)/bl1.bin \
 	-C bp.flashloader0.fname=$(TF_A_PATH)/build/fvp/$(TF_A_BUILD)/fip.bin \
 	-C bp.virtioblockdevice.image_path=$(BOOT_IMG)
+ifeq ($(SPMC_AT_EL),2)
+	FVP_ARGS += -C cluster0.gicv3.extended-interrupt-range-support=1 \
+		    -C cluster0.has_generic_authentication=1 \
+		    -C cluster0.has_pointer_authentication=2 \
+		    -C cluster0.has_branch_target_exception=1 \
+		    -C cluster0.has_arm_v8-4=1 \
+		    -C cluster0.has_large_system_ext=1 \
+		    -C cluster0.has_large_va=1 \
+		    -C cluster0.has_rndr=1 \
+		    -C cluster0.memory_tagging_support_level=3 \
+		    -C cluster1.gicv3.extended-interrupt-range-support=1 \
+		    -C cluster1.has_generic_authentication=1 \
+		    -C cluster1.has_pointer_authentication=2 \
+		    -C cluster1.has_branch_target_exception=1 \
+		    -C cluster1.has_arm_v8-4=1 \
+		    -C cluster1.has_large_system_ext=1 \
+		    -C cluster1.has_large_va=1 \
+		    -C cluster1.has_rndr=1 \
+		    -C cluster1.memory_tagging_support_level=3 \
+		    -C gic_distributor.extended-ppi-count=64 \
+		    -C gic_distributor.extended-spi-count=1024 \
+		    -C pci.pci_smmuv3.mmu.SMMU_AIDR=0x2 \
+		    -C pci.pci_smmuv3.mmu.SMMU_IDR0=0x0046123B \
+		    -C pci.pci_smmuv3.mmu.SMMU_IDR1=0x00600002 \
+		    -C pci.pci_smmuv3.mmu.SMMU_IDR3=0x1714 \
+		    -C pci.pci_smmuv3.mmu.SMMU_IDR5=0xFFFF0475 \
+		    -C pci.pci_smmuv3.mmu.SMMU_S_IDR1=0xA0000002 \
+		    -C pci.pci_smmuv3.mmu.SMMU_S_IDR2=0 \
+		    -C pci.pci_smmuv3.mmu.SMMU_S_IDR3=0
+endif
+ifeq ($(FVP_NETWORK_SUPPORT),y)
+	FVP_ARGS += -C bp.hostbridge.userNetworking=true \
+		    -C bp.hostbridge.userNetPorts="5555=5555,8080=80,8022=22" \
+		    -C bp.smsc_91c111.enabled=1 \
+		    -C bp.smsc_91c111.mac_address=auto \
+		    -C bp.virtio_net.enabled=1 \
+		    -C bp.virtio_net.hostbridge.userNetworking=1
+endif
+ifeq ($(FVP_NO_VISUALISATION),y)
+	FVP_ARGS += -C bp.vis.disable_visualisation=1 \
+		    -C bp.terminal_0.start_telnet=0 \
+		    -C bp.terminal_1.mode=raw \
+		    -C bp.terminal_1.start_telnet=0 \
+		    -C bp.terminal_2.mode=raw \
+		    -C bp.terminal_2.start_telnet=0 \
+		    -C bp.terminal_3.mode=raw \
+		    -C bp.terminal_3.start_telnet=0
+endif
+ifeq ($(TS_LOGGING_SP),y)
+	FVP_ARGS += -C bp.pl011_uart2.out_file=$(TS_LOGGING_SP_LOG)
+endif
 ifeq ($(FVP_VIRTFS_ENABLE),y)
 	FVP_ARGS += -C bp.virtiop9device.root_path=$(FVP_VIRTFS_HOST_DIR)
-endif
-else
-FVP_ARGS ?= \
-	--arm-v8.0 \
-	--cores=4 \
-	--secure-memory \
-	--visualization \
-	--gicv3 \
-	--data="$(TF_A_PATH)/build/fvp/$(TF_A_BUILD)/bl1.bin"@0x0 \
-	--data="$(TF_A_PATH)/build/fvp/$(TF_A_BUILD)/fip.bin"@0x8000000 \
-	--block-device=$(BOOT_IMG)
 endif
 
 run-only:
