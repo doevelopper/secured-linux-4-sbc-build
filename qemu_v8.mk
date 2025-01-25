@@ -30,14 +30,28 @@ QEMU_VIRTFS_AUTOMOUNT = y
 endif
 
 # Option to enable Rust examples
+# Currently supported only on x86_64 hosts
+ifeq ($(shell uname -m),x86_64)
 RUST_ENABLE ?= y
+endif
 
-include common.mk
-
-DEBUG ?= 1
+# Enable fTPM
+MEASURED_BOOT_FTPM ?= y
 
 # Option to build with GICV3 enabled
 GICV3 ?= y
+
+
+SEL0_SPS ?= n
+ifeq ($(SEL0_SPS),y)
+SPMC_AT_EL = 1
+ifneq ($(SPMC_AT_EL),1)
+$(error Unsupported SPMC_AT_EL value $(SPMC_AT_EL) for SEL0_SPS=y)
+endif
+# Needed for arm-ffa-user.ko
+QEMU_VIRTFS_AUTOMOUNT = y
+LINUX_COMMON_TARGETS += modules
+endif
 
 # Option to configure FF-A and SPM:
 # n:	disabled
@@ -55,11 +69,14 @@ PAUTH ?= n
 # Option to configure Memory Tagging Extension
 MEMTAG ?= n
 
+include common.mk
+
 ################################################################################
 # Paths to git projects and various binaries
 ################################################################################
 TF_A_PATH		?= $(ROOT)/trusted-firmware-a
-BINARIES_PATH		?= $(ROOT)/out/bin
+OUT_PATH		?= $(ROOT)/out
+BINARIES_PATH		?= $(OUT_PATH)/bin
 QEMU_PATH		?= $(ROOT)/qemu
 QEMU_BUILD		?= $(QEMU_PATH)/build
 MODULE_OUTPUT		?= $(ROOT)/out/kernel_modules
@@ -75,6 +92,10 @@ ROOTFS_UGZ		?= $(BINARIES_PATH)/rootfs.cpio.uboot
 KERNEL_IMAGE		?= $(LINUX_PATH)/arch/arm64/boot/Image
 KERNEL_IMAGEGZ		?= $(LINUX_PATH)/arch/arm64/boot/Image.gz
 KERNEL_UIMAGE		?= $(BINARIES_PATH)/uImage
+
+SCMI_DTSO 		?= $(ROOT)/build/qemu_v8/qemu-v8-scmi-overlay.dtso
+SCMI_DTBO 		?= $(BINARIES_PATH)/qemu-v8-scmi-overlay.dtbo
+SCMI_DTB 		?= $(BINARIES_PATH)/qemu-v8-scmi.dtb
 
 # Load and entry addresses (u-boot only)
 # If you change this please also change in kconfigs/u-boot_qemu_v8.conf
@@ -121,11 +142,18 @@ ifeq ($(XEN_BOOT),y)
 TARGET_DEPS		+= xen-create-image
 endif
 
+ifeq ($(WITH_SCMI),y)
+TARGET_DEPS		+= $(SCMI_DTB)
+endif
+
 all: $(TARGET_DEPS)
 
 clean: $(TARGET_CLEAN)
 
 $(BINARIES_PATH):
+	mkdir -p $@
+
+$(OUT_PATH):
 	mkdir -p $@
 
 include toolchain.mk
@@ -134,7 +162,9 @@ include toolchain.mk
 # ARM Trusted Firmware
 ################################################################################
 TF_A_EXPORTS ?= \
-	CROSS_COMPILE="$(CCACHE)$(AARCH64_CROSS_COMPILE)"
+	CROSS_COMPILE="$(CCACHE)$(AARCH64_CROSS_COMPILE)" \
+	CC="$(CCACHE)$(AARCH64_CROSS_COMPILE)gcc" \
+	LD="$(CCACHE)$(AARCH64_CROSS_COMPILE)ld"
 
 TF_A_DEBUG ?= $(DEBUG)
 ifeq ($(TF_A_DEBUG),0)
@@ -155,6 +185,7 @@ TF_A_FLAGS ?= \
 	ENABLE_SME_FOR_SWD=1 \
 	ENABLE_FEAT_FGT=2 \
 	ENABLE_FEAT_HCX=2 \
+	ENABLE_FEAT_ECV=2 \
 	BL32_RAM_LOCATION=tdram \
 	DEBUG=$(TF_A_DEBUG) \
 	LOG_LEVEL=$(TF_A_LOGLVL)
@@ -171,8 +202,6 @@ TF_A_FLAGS_SPMC_AT_EL_1 += QEMU_TOS_FW_CONFIG_DTS=../build/qemu_v8/spmc_el1_mani
 TF_A_FLAGS_SPMC_AT_EL_1 += SPMC_OPTEE=1
 TF_A_FLAGS_SPMC_AT_EL_1 += QEMU_TOS_FW_CONFIG_DTS=../build/qemu_v8/spmc_el1_manifest.dts
 TF_A_FLAGS_SPMC_AT_EL_2  = SPD=spmd 
-TF_A_FLAGS_SPMC_AT_EL_2 += ENABLE_SPE_FOR_LOWER_ELS=0
-TF_A_FLAGS_SPMC_AT_EL_2 += ENABLE_SME_FOR_NS=0 ENABLE_SME_FOR_SWD=0
 TF_A_FLAGS_SPMC_AT_EL_2 += ENABLE_FEAT_SEL2=1
 TF_A_FLAGS_SPMC_AT_EL_2 += SP_LAYOUT_FILE=../build/qemu_v8/sp_layout.json
 TF_A_FLAGS_SPMC_AT_EL_2 += NEED_FDT=yes
@@ -180,10 +209,10 @@ TF_A_FLAGS_SPMC_AT_EL_2 += BL32=$(HAFNIUM_BIN)
 TF_A_FLAGS_SPMC_AT_EL_2 += QEMU_TOS_FW_CONFIG_DTS=../build/qemu_v8/spmc_el2_manifest.dts
 TF_A_FLAGS_SPMC_AT_EL_2 += QEMU_TB_FW_CONFIG_DTS=../build/qemu_v8/tb_fw_config.dts
 ifneq ($(PAUTH),y)
-TF_A_FLAGS_SPMC_AT_EL_2 += CTX_INCLUDE_PAUTH_REGS=1
+TF_A_FLAGS_SPMC_AT_EL_2 += BRANCH_PROTECTION=1
 endif
 ifneq ($(MEMTAG),y)
-TF_A_FLAGS_SPMC_AT_EL_2 += CTX_INCLUDE_MTE_REGS=1
+TF_A_FLAGS_SPMC_AT_EL_2 += ENABLE_FEAT_MTE2=2
 endif
 TF_A_FLAGS_SPMC_AT_EL_3  = SPD=spmd SPMC_AT_EL3=1
 TF_A_FLAGS_SPMC_AT_EL_3 += CTX_INCLUDE_EL2_REGS=0 SPMD_SPM_AT_SEL2=0
@@ -201,10 +230,10 @@ TF_A_FLAGS += \
 endif
 
 ifeq ($(PAUTH),y)
-TF_A_FLAGS += CTX_INCLUDE_PAUTH_REGS=1
+TF_A_FLAGS += BRANCH_PROTECTION=1
 endif
 ifeq ($(MEMTAG),y)
-TF_A_FLAGS += CTX_INCLUDE_MTE_REGS=1
+TF_A_FLAGS += ENABLE_FEAT_MTE2=2
 endif
 
 arm-tf: $(BL32_DEPS) $(BL33_DEPS)
@@ -262,10 +291,14 @@ $(QEMU_BUILD)/config-host.mak:
 	cd $(QEMU_PATH); ./configure --target-list=aarch64-softmmu --enable-slirp\
 			$(QEMU_CONFIGURE_PARAMS_COMMON)
 
-qemu: $(QEMU_BUILD)/config-host.mak
+qemu: $(QEMU_BUILD)/.stamp_qemu
+
+$(QEMU_BUILD)/.stamp_qemu: $(QEMU_BUILD)/config-host.mak
 	$(MAKE) -C $(QEMU_PATH)
+	touch $@
 
 qemu-clean:
+	rm -f $(QEMU_BUILD)/.stamp_qemu
 	$(MAKE) -C $(QEMU_PATH) distclean
 
 ################################################################################
@@ -330,6 +363,25 @@ LINUX_CLEANER_COMMON_FLAGS += ARCH=arm64
 linux-cleaner: linux-cleaner-common
 
 ################################################################################
+# Trusted Services
+################################################################################
+ifeq ($(SEL0_SPS),y)
+SP_PACKAGING_METHOD = embedded
+SPMC_TESTS=y
+include trusted-services.mk
+
+# SPMC test SPs
+OPTEE_OS_COMMON_EXTRA_FLAGS     += CFG_SPMC_TESTS=y CFG_SECURE_PARTITION=y
+OPTEE_OS_COMMON_EXTRA_FLAGS     += CFG_SP_SKIP_FAILED=y
+OPTEE_OS_COMMON_EXTRA_FLAGS     += CFG_DT=y CFG_MAP_EXT_DT_SECURE=y
+SP_SPMC_TEST_EXTRA_FLAGS	+= -DCFG_TEST_MEM_REGION_ADDRESS=0x0efff000
+$(eval $(call build-sp,spm-test1,opteesp,5c9edbc3-7b3a-4367-9f83-7c191ae86a37,$(SP_SPMC_TEST_EXTRA_FLAGS)))
+$(eval $(call build-sp,spm-test2,opteesp,7817164c-c40c-4d1a-867a-9bb2278cf41a,$(SP_SPMC_TEST_EXTRA_FLAGS)))
+$(eval $(call build-sp,spm-test3,opteesp,23eb0100-e32a-4497-9052-2f11e584afa6,$(SP_SPMC_TEST_EXTRA_FLAGS)))
+$(eval $(call build-sp,spm-test4,opteesp,423762ed-7772-406f-99d8-0c27da0abbf8,$(SP_SPMC_TEST_EXTRA_FLAGS)))
+endif
+
+################################################################################
 # OP-TEE
 ################################################################################
 OPTEE_OS_COMMON_FLAGS += DEBUG=$(DEBUG) CFG_ARM_GICV3=$(GICV3)
@@ -362,6 +414,11 @@ CFG_TEE_CORE_NB_CORE ?= $(QEMU_SMP)
 OPTEE_OS_COMMON_FLAGS += CFG_TEE_CORE_NB_CORE=$(CFG_TEE_CORE_NB_CORE)
 endif
 
+ifeq ($(WITH_SCMI),y)
+OPTEE_OS_COMMON_FLAGS += CFG_SCMI_SCPFW=y
+OPTEE_OS_COMMON_FLAGS += CFG_SCP_FIRMWARE=$(ROOT)/SCP-firmware
+endif
+
 OPTEE_OS_COMMON_FLAGS += $(OPTEE_OS_COMMON_FLAGS_SPMC_AT_EL_$(SPMC_AT_EL))
 
 optee-os: optee-os-common
@@ -372,7 +429,7 @@ optee-os-clean: optee-os-clean-common
 # Hafnium
 ################################################################################
 
-HAFNIUM_EXPORTS = PATH=$(HAFNIUM_PATH)/prebuilts/linux-x64/clang/bin:$(HAFNIUM_PATH)/prebuilts/linux-x64/dtc:$(PATH)
+HAFNIUM_EXPORTS = PATH=$(TOOLCHAIN_ROOT)/clang-$(CLANG_BUILD_VER)/bin:$(PATH)
 
 .hafnium_checkout:
 	git -C $(HAFNIUM_PATH) submodule update --init
@@ -381,7 +438,7 @@ HAFNIUM_EXPORTS = PATH=$(HAFNIUM_PATH)/prebuilts/linux-x64/clang/bin:$(HAFNIUM_P
 hafnium: $(HAFNIUM_BIN)
 
 $(HAFNIUM_BIN): .hafnium_checkout | $(OUT_PATH)
-	$(HAFNIUM_EXPORTS) $(MAKE) -C $(HAFNIUM_PATH) $(HAFNIUM_FLAGS) all
+	$(HAFNIUM_EXPORTS) $(MAKE) -C $(HAFNIUM_PATH) $(HAFNIUM_FLAGS) PLATFORM=secure_qemu_aarch64
 
 
 ################################################################################
@@ -472,27 +529,33 @@ run: all
 
 
 ifeq ($(XEN_BOOT),y)
-QEMU_CPU	?= cortex-a57
-QEMU_MEM 	?= 3072
-QEMU_SMP	?= 4
 QEMU_VIRT	= true
-QEMU_XEN	?= -drive if=none,file=$(XEN_EXT4),format=raw,id=hd1 \
-		   -device virtio-blk-device,drive=hd1
-else
-ifeq ($(SPMC_AT_EL),2)
+else ifeq ($(SPMC_AT_EL),2)
 QEMU_VIRT	= true
 else
 QEMU_VIRT	= false
 endif
-ifeq ($(SPMC_AT_EL),n)
+
+ifeq ($(XEN_BOOT),y)
+QEMU_MEM 	?= 3072
+QEMU_SMP	?= 4
+QEMU_XEN	?= -drive if=none,file=$(XEN_EXT4),format=raw,id=hd1 \
+		   -device virtio-blk-device,drive=hd1
+else
+QEMU_SMP 	?= 2
+QEMU_MEM 	?= 1057
+endif
+
+ifeq ($(XEN_BOOT),y)
+QEMU_SME	= off
+else ifeq ($(SPMC_AT_EL),n)
+QEMU_SME	= on
+else ifeq ($(SPMC_AT_EL),2)
 QEMU_SME	= on
 else
 QEMU_SME	= off
 endif
 QEMU_CPU	?= max,sme=$(QEMU_SME),pauth-impdef=on
-QEMU_SMP 	?= 2
-QEMU_MEM 	?= 1057
-endif
 
 ifeq ($(MEMTAG),y)
 QEMU_MTE	= on
@@ -502,6 +565,41 @@ else
 QEMU_MTE	= off
 endif
 
+QEMU_BASE_ARGS = -nographic
+QEMU_BASE_ARGS += -smp $(QEMU_SMP)
+QEMU_BASE_ARGS += -cpu $(QEMU_CPU)
+QEMU_BASE_ARGS += -d unimp -semihosting-config enable=on,target=native
+QEMU_BASE_ARGS += -m $(QEMU_MEM)
+QEMU_BASE_ARGS += -bios bl1.bin
+QEMU_BASE_ARGS += -initrd rootfs.cpio.gz
+QEMU_BASE_ARGS += -kernel Image
+QEMU_BASE_ARGS += -append 'console=ttyAMA0,38400 keep_bootcon root=/dev/vda2 $(QEMU_KERNEL_BOOTARGS)'
+QEMU_BASE_ARGS += $(QEMU_XEN)
+QEMU_BASE_ARGS += $(QEMU_EXTRA_ARGS)
+QEMU_BASE_ARGS += -machine virt,acpi=off,secure=on,mte=$(QEMU_MTE),gic-version=$(QEMU_GIC_VERSION),virtualization=$(QEMU_VIRT)
+
+ifeq ($(WITH_SCMI),y)
+QEMU_SCMI_ARGS 	= -dtb $(SCMI_DTB)
+
+$(SCMI_DTBO): $(SCMI_DTSO)
+	mkdir -p $(BINARIES_PATH)
+	dtc -I dts -O dtb -o $(SCMI_DTBO) $(SCMI_DTSO)
+
+$(SCMI_DTB): $(SCMI_DTBO) $(QEMU_BUILD)/.stamp_qemu linux arm-tf buildroot
+	ln -sf $(ROOT)/out-br/images/rootfs.cpio.gz $(BINARIES_PATH)/
+	cd $(BINARIES_PATH) && $(QEMU_BUILD)/aarch64-softmmu/qemu-system-aarch64 \
+		$(QEMU_BASE_ARGS) -machine dumpdtb=qemu_v8.dtb
+	cd $(BINARIES_PATH) && fdtoverlay -i qemu_v8.dtb -o $(SCMI_DTB) $(SCMI_DTBO)
+endif
+
+QEMU_RUN_ARGS = $(QEMU_BASE_ARGS) $(QEMU_SCMI_ARGS)
+QEMU_RUN_ARGS += $(QEMU_RUN_ARGS_COMMON)
+QEMU_RUN_ARGS += -s -S -serial tcp:127.0.0.1:$(QEMU_NW_PORT) -serial tcp:127.0.0.1:$(QEMU_SW_PORT) 
+
+# The aarch64-softmmu part of the path to qemu-system-aarch64 was removed
+# somewhere between 8.1.2 and 9.1.2
+QEMU_BIN = $(or $(wildcard $(QEMU_BUILD)/qemu-system-aarch64),$(wildcard $(QEMU_BUILD)/aarch64-softmmu/qemu-system-aarch64),qemu-system-aarch64-not-found)
+
 .PHONY: run-only
 run-only:
 	ln -sf $(ROOT)/out-br/images/rootfs.cpio.gz $(BINARIES_PATH)/
@@ -510,20 +608,7 @@ run-only:
 	$(call launch-terminal,$(QEMU_NW_PORT),"Normal World")
 	$(call launch-terminal,$(QEMU_SW_PORT),"Secure World")
 	$(call wait-for-ports,$(QEMU_NW_PORT),$(QEMU_SW_PORT))
-	cd $(BINARIES_PATH) && $(QEMU_BUILD)/aarch64-softmmu/qemu-system-aarch64 \
-		-nographic \
-		-serial tcp:127.0.0.1:$(QEMU_NW_PORT) -serial tcp:127.0.0.1:$(QEMU_SW_PORT) \
-		-smp $(QEMU_SMP) \
-		-s -S -machine virt,acpi=off,secure=on,mte=$(QEMU_MTE),gic-version=$(QEMU_GIC_VERSION),virtualization=$(QEMU_VIRT) \
-		-cpu $(QEMU_CPU) \
-		-d unimp -semihosting-config enable=on,target=native \
-		-m $(QEMU_MEM) \
-		-bios bl1.bin		\
-		-initrd rootfs.cpio.gz \
-		-kernel Image \
-		-append 'console=ttyAMA0,38400 keep_bootcon root=/dev/vda2 $(QEMU_KERNEL_BOOTARGS)' \
-		$(QEMU_XEN) \
-		$(QEMU_EXTRA_ARGS)
+	cd $(BINARIES_PATH) && $(QEMU_BIN) $(QEMU_RUN_ARGS)
 
 ifneq ($(filter check check-rust,$(MAKECMDGOALS)),)
 CHECK_DEPS := all
@@ -539,16 +624,17 @@ ifneq ($(XTEST_ARGS),)
 check-args += --xtest-args "$(XTEST_ARGS)"
 endif
 
+QEMU_CHECK_ARGS = $(QEMU_BASE_ARGS) $(QEMU_SCMI_ARGS)
+QEMU_CHECK_ARGS += -serial mon:stdio -serial file:serial1.log
+ifeq ($(XEN_BOOT),y)
+QEMU_CHECK_ARGS += -fsdev local,id=fsdev0,path=../..,security_model=none -device virtio-9p-device,fsdev=fsdev0,mount_tag=host
+endif
+
 check: $(CHECK_DEPS)
 	ln -sf $(ROOT)/out-br/images/rootfs.cpio.gz $(BINARIES_PATH)/
 	cd $(BINARIES_PATH) && \
-		export QEMU=$(QEMU_BUILD)/aarch64-softmmu/qemu-system-aarch64 && \
-		export QEMU_SMP=$(QEMU_SMP) && \
-		export QEMU_MTE=$(QEMU_MTE) && \
-		export QEMU_GIC=$(QEMU_GIC_VERSION) && \
-		export QEMU_MEM=$(QEMU_MEM) && \
-		export QEMU_CPU=$(QEMU_CPU) && \
-		export QEMU_VIRT=$(QEMU_VIRT) && \
+		export QEMU=$(QEMU_BIN) && \
+		export QEMU_CHECK_ARGS="$(QEMU_CHECK_ARGS)" && \
 		export XEN_BOOT=$(XEN_BOOT) && \
 		export XEN_FFA=$(XEN_FFA) && \
 		export RUST_ENABLE=$(RUST_ENABLE) && \

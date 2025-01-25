@@ -4,6 +4,7 @@
 SHELL				= /bin/bash
 ROOT				?= $(CURDIR)/..
 TOOLCHAIN_ROOT 			?= $(ROOT)/toolchains
+RUST_TOOLCHAIN_PATH 		?= $(TOOLCHAIN_ROOT)/rust
 UNAME_M				:= $(shell uname -m)
 ARCH				?= arm
 
@@ -44,19 +45,30 @@ define build_toolchain
 	@touch $2/.done
 endef
 
+# Download the Rust toolchain
+define dl-rust-toolchain
+	@if [ ! -d "$(1)" ]; then \
+		mkdir -p $(1) && \
+		export RUSTUP_HOME=$(1)/.rustup && \
+		export CARGO_HOME=$(1)/.cargo && \
+		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path; \
+	fi
+endef
+
 ifeq ($(UNAME_M),x86_64)
 ifeq ($(ARCH),arm)
+# Please keep in sync with br-ext/configs/toolchain-aarch32
+# and below for aarch64 host
 AARCH32_PATH 			?= $(TOOLCHAIN_ROOT)/aarch32
 AARCH32_CROSS_COMPILE 		?= $(AARCH32_PATH)/bin/arm-linux-gnueabihf-
 AARCH32_GCC_VERSION 		?= arm-gnu-toolchain-11.3.rel1-x86_64-arm-none-linux-gnueabihf
 SRC_AARCH32_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu/11.3.rel1/binrel/$(AARCH32_GCC_VERSION).tar.xz
 
+# Please keep in sync with br-ext/configs/toolchain-aarch64
 AARCH64_PATH 			?= $(TOOLCHAIN_ROOT)/aarch64
 AARCH64_CROSS_COMPILE 		?= $(AARCH64_PATH)/bin/aarch64-linux-gnu-
 AARCH64_GCC_VERSION 		?= arm-gnu-toolchain-11.3.rel1-x86_64-aarch64-none-linux-gnu
 SRC_AARCH64_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu/11.3.rel1/binrel/$(AARCH64_GCC_VERSION).tar.xz
-
-RUST_TOOLCHAIN_PATH 		?= $(TOOLCHAIN_ROOT)/rust
 
 .PHONY: toolchains
 toolchains: aarch32-toolchain aarch64-toolchain rust-toolchain
@@ -68,16 +80,6 @@ aarch32-toolchain:
 .PHONY: aarch64-toolchain
 aarch64-toolchain:
 	$(call dltc,$(AARCH64_PATH),$(SRC_AARCH64_GCC),$(AARCH64_GCC_VERSION))
-
-# Download the Rust toolchain
-define dl-rust-toolchain
-	@if [ ! -d "$(1)" ]; then \
-		mkdir -p $(1) && \
-		export RUSTUP_HOME=$(1)/.rustup && \
-		export CARGO_HOME=$(1)/.cargo && \
-		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path; \
-	fi
-endef
 
 .PHONY: rust-toolchain
 rust-toolchain:
@@ -117,10 +119,12 @@ endif
 
 else ifeq ($(UNAME_M),aarch64)
 
+# Please keep in sync with br-ext/configs/toolchain-aarch32
+# and above for x86_64 host
 AARCH32_PATH 			?= $(TOOLCHAIN_ROOT)/aarch32
 AARCH32_CROSS_COMPILE 		?= $(AARCH32_PATH)/bin/arm-linux-gnueabihf-
-AARCH32_GCC_VERSION 		?= gcc-arm-10.2-2020.11-aarch64-arm-none-linux-gnueabihf
-SRC_AARCH32_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu-a/10.2-2020.11/binrel/$(AARCH32_GCC_VERSION).tar.xz
+AARCH32_GCC_VERSION 		?= arm-gnu-toolchain-11.3.rel1-aarch64-arm-none-linux-gnueabihf
+SRC_AARCH32_GCC 		?= https://developer.arm.com/-/media/Files/downloads/gnu/11.3.rel1/binrel/$(AARCH32_GCC_VERSION).tar.xz
 
 # There isn't any native aarch64 toolchain released from Arm and buildroot
 # doesn't support distribution toolchain [1]. So we are left with no choice
@@ -131,7 +135,7 @@ AARCH64_PATH 			?= $(TOOLCHAIN_ROOT)/aarch64
 AARCH64_CROSS_COMPILE 		?= $(AARCH64_PATH)/bin/aarch64-linux-
 
 .PHONY: toolchains
-toolchains: aarch32-toolchain $(AARCH64_PATH)/.done
+toolchains: aarch32-toolchain $(AARCH64_PATH)/.done rust-toolchain
 
 .PHONY: aarch32-toolchain
 aarch32-toolchain:
@@ -139,6 +143,10 @@ aarch32-toolchain:
 
 $(AARCH64_PATH)/.done:
 	$(call build_toolchain,aarch64,$(AARCH64_PATH),aarch64,gnu)
+
+.PHONY: rust-toolchain
+rust-toolchain:
+	$(call dl-rust-toolchain,$(RUST_TOOLCHAIN_PATH))
 
 else # $(UNAME_M) != x86_64 or $(UNAME_M) != aarch64
 AARCH32_PATH 			:= $(TOOLCHAIN_ROOT)/aarch32
@@ -155,3 +163,16 @@ $(AARCH64_PATH)/.done:
 $(AARCH32_PATH)/.done:
 	$(call build_toolchain,aarch32,$(AARCH32_PATH),arm,gnueabihf)
 endif
+
+# Recipe to build Clang from sources and install it in
+# $(TOOLCHAIN_ROOT)/clang-x.y.z/bin
+
+CLANG_BUILD_VER_MAJ=18
+CLANG_BUILD_VER=$(CLANG_BUILD_VER_MAJ).1.7
+CLANG_BUILD_IMAGE=clang-$(CLANG_BUILD_VER)-$(UNAME_M)
+
+clang-toolchains-build:
+	docker build --build-arg VER_MAJ=$(CLANG_BUILD_VER_MAJ) --build-arg VER=$(CLANG_BUILD_VER) -t $(CLANG_BUILD_IMAGE) clang/
+	id=$$(docker create $(CLANG_BUILD_IMAGE)) && \
+		docker cp $${id}:/root/clang-$(CLANG_BUILD_VER) $(TOOLCHAIN_ROOT) && \
+		docker rm $${id}
